@@ -64,10 +64,10 @@ class Challenge:
 class Settings:
     runtime_seconds: float = 3_600.0
     shutdown_guard_seconds: float = 15.0
-    discovery_fraction: float = 0.74
-    prediction_batch: int = 192
-    proposal_multiplier: int = 4
-    min_surrogate_samples: int = 320
+    discovery_fraction: float = 0.84
+    prediction_batch: int = 96
+    proposal_multiplier: int = 8
+    min_surrogate_samples: int = 96
     surrogate_refit_every: int = 3
     entropy_margin: float = 0.006
     oracle_timeout_seconds: float = 480.0
@@ -82,11 +82,11 @@ class Settings:
             shutdown_guard_seconds=float(
                 os.environ.get("NOVA_SHUTDOWN_GUARD_SECONDS", "15")
             ),
-            discovery_fraction=float(os.environ.get("NOVA_DISCOVERY_FRACTION", "0.74")),
-            prediction_batch=int(os.environ.get("NOVA_PREDICTION_BATCH", "192")),
-            proposal_multiplier=int(os.environ.get("NOVA_PROPOSAL_MULTIPLIER", "4")),
+            discovery_fraction=float(os.environ.get("NOVA_DISCOVERY_FRACTION", "0.84")),
+            prediction_batch=int(os.environ.get("NOVA_PREDICTION_BATCH", "96")),
+            proposal_multiplier=int(os.environ.get("NOVA_PROPOSAL_MULTIPLIER", "8")),
             min_surrogate_samples=int(
-                os.environ.get("NOVA_MIN_SURROGATE_SAMPLES", "320")
+                os.environ.get("NOVA_MIN_SURROGATE_SAMPLES", "96")
             ),
             surrogate_refit_every=int(
                 os.environ.get("NOVA_SURROGATE_REFIT_EVERY", "3")
@@ -351,6 +351,7 @@ class OracleScorer:
         )
         self.durations: list[float] = []
         self.predictions = 0
+        self.last_scores: list[float] = []
 
     @property
     def molecules_per_request(self) -> int:
@@ -363,6 +364,7 @@ class OracleScorer:
 
     def score(self, candidates: Sequence[Candidate]) -> tuple[int, float]:
         batch = list(candidates[: self.molecules_per_request])
+        self.last_scores = []
         started = time.monotonic()
         rows = self.oracle.score(
             list(self.challenge.proteins), [candidate.smiles for candidate in batch]
@@ -386,9 +388,9 @@ class OracleScorer:
             target_score = sum(values[:target_count]) / target_count
             anti = values[target_count:]
             antitarget_score = sum(anti) / len(anti) if anti else 0.0
-            candidate.observations.append(
-                target_score - self.challenge.antitarget_weight * antitarget_score
-            )
+            score = target_score - self.challenge.antitarget_weight * antitarget_score
+            candidate.observations.append(score)
+            self.last_scores.append(score)
             accepted += 1
         self.predictions += len(batch) * len(self.challenge.proteins)
         return accepted, elapsed
@@ -544,12 +546,13 @@ class Search:
             if include_unscored
             else self.store.scored()
         )
+        noise_floor = self.store.noise_floor()
         portfolio, score, entropy = select_portfolio(
             candidates,
             self.challenge.num_molecules,
             self.challenge.tanimoto_threshold,
             self.challenge.entropy_threshold + self.settings.entropy_margin,
-            self.store.noise_floor(),
+            noise_floor,
         )
         if len(portfolio) != self.challenge.num_molecules:
             return False
@@ -558,6 +561,20 @@ class Search:
         names = tuple(candidate.name for candidate in portfolio)
         if names == self.last_portfolio:
             return True
+        if self.last_portfolio is not None:
+            previous = [
+                self.store.candidates[name] for name in self.last_portfolio
+            ]
+            previous_score = float(
+                np.mean(
+                    [
+                        candidate.conservative_score(noise_floor)
+                        for candidate in previous
+                    ]
+                )
+            )
+            if score <= previous_score:
+                return True
         write_result(self.output_path, portfolio)
         self.last_portfolio = names
         log.info(
@@ -589,8 +606,9 @@ class Search:
 
         iteration = 0
         prepared_proposals = None
-        # Proposal construction is independent CPU work. Preparing one batch
-        # ahead hides it under the current, blocking GPU-oracle request.
+        # Construct the next candidate pool while the current oracle request
+        # runs. The one-batch delay also keeps exploration from collapsing too
+        # quickly around the newest noisy winners.
         with ThreadPoolExecutor(max_workers=1) as proposal_worker:
             while True:
                 remaining = deadline - time.monotonic()
@@ -634,18 +652,26 @@ class Search:
                     )
                     accepted, elapsed = 0, 0.0
 
-                # In production this normally completed while the oracle was
-                # busy. Joining before reading the store keeps state access simple.
+                # Join before publishing so no thread mutates the candidate store
+                # while the portfolio is being assembled.
                 prepared_proposals = (
                     next_proposals.result() if next_proposals is not None else None
                 )
                 log.info(
-                    "iteration=%d phase=%s molecules=%d accepted=%d oracle=%.1fs remaining=%.1fs",
+                    "iteration=%d phase=%s molecules=%d accepted=%d oracle=%.1fs "
+                    "batch_mean=%.6f batch_p90=%.6f batch_best=%.6f remaining=%.1fs",
                     iteration,
                     "discovery" if discovery else "repeat",
                     len(batch),
                     accepted,
                     elapsed,
+                    float(np.mean(self.scorer.last_scores))
+                    if self.scorer.last_scores
+                    else -math.inf,
+                    float(np.quantile(self.scorer.last_scores, 0.9))
+                    if self.scorer.last_scores
+                    else -math.inf,
+                    max(self.scorer.last_scores, default=-math.inf),
                     deadline - time.monotonic(),
                 )
                 if not accepted:
@@ -654,7 +680,10 @@ class Search:
                 if (
                     discovery
                     and len(self.store.scored()) >= self.settings.min_surrogate_samples
-                    and iteration % self.settings.surrogate_refit_every == 0
+                    and (
+                        not self.surrogate.fitted
+                        or iteration % self.settings.surrogate_refit_every == 0
+                    )
                 ):
                     fit_started = time.monotonic()
                     self.surrogate.fit(self.store.scored())

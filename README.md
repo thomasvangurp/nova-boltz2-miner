@@ -10,18 +10,21 @@ the current challenge through the provided oracle socket.
 ## Search
 
 1. Build and atomically publish a validator-safe random portfolio immediately.
-2. Score 192 molecule/target pairs per request: eight balanced rounds across
-   the oracle's 24 shards and faster feedback than a cap-sized batch.
+2. Score 96 molecule/target pairs per request: four balanced rounds across
+   the oracle's 24 shards, retaining nearly all throughput while doubling the
+   number of adaptive decisions versus a batch of 192.
 3. Complete one reaction axis around component-disjoint current-run winners.
 4. Train an ExtraTrees proposal model on current-run observations only.
-5. Repeat-score the leading pool and rank by a conservative estimate.
+5. Spend the first 84% of the hour discovering candidates, then repeat-score
+   the leading pool and rank by a conservative estimate.
 6. Assemble exactly 100 molecules under InChI, Tanimoto, and MACCS constraints.
 7. Atomically promote `result.json` after every completed improvement.
 
-CPU proposal construction runs one batch ahead while the blocking GPU oracle
-is busy. After the first response, the deadline guard uses measured request
-time plus 15 seconds. If the validator still kills the final attempt, the last
-atomic checkpoint remains complete.
+CPU proposal construction builds an eight-times-larger pool one batch ahead
+while the blocking GPU oracle is busy. The surrogate is first fitted after 96
+current-run observations, then ranks that pool. After the first response, the
+deadline guard uses measured request time plus 15 seconds. If the validator
+still kills the final attempt, the last atomic checkpoint remains complete.
 
 The entire production runtime is intentionally kept in three readable files:
 `miner.py`, `search.py`, and `portfolio.py`.

@@ -7,6 +7,7 @@ from threading import Event
 
 from rdkit import DataStructs
 
+import search as search_module
 from portfolio import maccs_entropy, select_portfolio, write_result
 from search import (
     CandidateStore,
@@ -130,7 +131,23 @@ def test_oracle_batching_and_score_formula():
     accepted, _ = scorer.score(candidates)
     assert accepted == 8
     assert scorer.predictions == 8
+    assert len(scorer.last_scores) == 8
     assert all(len(candidate.observations) == 1 for candidate in candidates[:8])
+
+
+def test_production_defaults_favour_adaptive_discovery(monkeypatch):
+    for name in (
+        "NOVA_DISCOVERY_FRACTION",
+        "NOVA_PREDICTION_BATCH",
+        "NOVA_PROPOSAL_MULTIPLIER",
+        "NOVA_MIN_SURROGATE_SAMPLES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings.from_environment()
+    assert settings.discovery_fraction == 0.84
+    assert settings.prediction_batch == 96
+    assert settings.proposal_multiplier == 8
+    assert settings.min_surrogate_samples == 96
 
 
 def test_portfolio_is_exact_diverse_and_entropy_safe(tmp_path):
@@ -194,8 +211,63 @@ def test_short_end_to_end_run_preserves_valid_checkpoint(tmp_path):
     assert search.surrogate.fitted
 
 
+def test_surrogate_fits_as_soon_as_the_sample_threshold_is_reached(tmp_path):
+    cfg = challenge(num_molecules=20)
+    search = Search(
+        cfg,
+        Settings(
+            runtime_seconds=1_000,
+            shutdown_guard_seconds=0,
+            prediction_batch=24,
+            proposal_multiplier=2,
+            min_surrogate_samples=40,
+            surrogate_refit_every=3,
+            max_iterations=2,
+        ),
+        str(tmp_path / "result.json"),
+        "/unused",
+        oracle=FakeOracle(),
+        db_path=str(BLUEPRINT_DB),
+    )
+    search.run()
+    assert search.scorer.predictions == 48
+    assert search.surrogate.fitted
+
+
+def test_worse_portfolio_never_replaces_the_published_checkpoint(
+    tmp_path, monkeypatch
+):
+    cfg = challenge(num_molecules=2)
+    result_path = tmp_path / "result.json"
+    search = Search(
+        cfg,
+        Settings(prediction_batch=4),
+        str(result_path),
+        "/unused",
+        oracle=FakeOracle(),
+        db_path=str(BLUEPRINT_DB),
+    )
+    candidates = search.random_candidates(4)
+    for candidate, score in zip(candidates, (0.8, 0.7, 0.2, 0.1)):
+        candidate.observations.append(score)
+    original = candidates[:2]
+    search.last_portfolio = tuple(candidate.name for candidate in original)
+    write_result(result_path, original)
+
+    monkeypatch.setattr(
+        search_module,
+        "select_portfolio",
+        lambda *args, **kwargs: (candidates[2:], 0.15, 0.5),
+    )
+    assert search.publish()
+    assert json.loads(result_path.read_text()) == {
+        "molecules": [candidate.name for candidate in original]
+    }
+
+
 def test_next_proposals_start_while_oracle_is_busy(tmp_path):
     cfg = challenge(num_molecules=20)
+
     proposals_started = Event()
 
     class CoordinatedOracle(FakeOracle):
