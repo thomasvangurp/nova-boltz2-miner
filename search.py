@@ -129,6 +129,23 @@ class Reaction:
     component_pools: tuple[tuple[int, ...], ...]
 
 
+@dataclass(frozen=True)
+class CompletionArm:
+    """One row/column operation: vary one axis and keep the rest fixed."""
+
+    reaction_id: int
+    varying_axis: int
+    fixed_components: tuple[int | None, ...]
+
+    @classmethod
+    def around(cls, candidate: Candidate, varying_axis: int) -> "CompletionArm":
+        fixed = tuple(
+            None if index == varying_axis else component
+            for index, component in enumerate(candidate.components)
+        )
+        return cls(candidate.reaction_id, varying_axis, fixed)
+
+
 @dataclass(eq=False)
 class Candidate:
     name: str
@@ -216,22 +233,31 @@ class ReactionSpace:
             components = [rng.choice(pool) for pool in reaction.component_pools]
             yield reaction_name(reaction.reaction_id, components)
 
-    def neighbour_names(
-        self, rng: random.Random, seeds: Sequence[Candidate], count: int
-    ):
-        """Vary one axis around complete molecules that the oracle liked."""
-        if not seeds:
-            yield from self.random_names(rng, count)
-            return
-        seeds = list(seeds)
-        rng.shuffle(seeds)
-        for index in range(count):
-            seed = seeds[index % len(seeds)]
-            reaction = self.by_id[seed.reaction_id]
-            components = list(seed.components)
-            axis = (index // len(seeds)) % len(components)
-            components[axis] = rng.choice(reaction.component_pools[axis])
-            yield reaction_name(reaction.reaction_id, components)
+    def completion_arms(self, seeds: Sequence[Candidate]) -> list[CompletionArm]:
+        """Distinct rows/columns surrounding the current complete-molecule seeds."""
+        arms = {
+            CompletionArm.around(seed, axis)
+            for seed in seeds
+            for axis in range(len(seed.components))
+        }
+        return sorted(
+            arms,
+            key=lambda arm: (
+                arm.reaction_id,
+                arm.varying_axis,
+                tuple(-1 if value is None else value for value in arm.fixed_components),
+            ),
+        )
+
+    def name_from_arm(self, rng: random.Random, arm: CompletionArm) -> str:
+        reaction = self.by_id[arm.reaction_id]
+        components = list(arm.fixed_components)
+        components[arm.varying_axis] = rng.choice(
+            reaction.component_pools[arm.varying_axis]
+        )
+        return reaction_name(
+            arm.reaction_id, [int(component) for component in components]
+        )
 
 
 class CandidateStore:
@@ -498,21 +524,74 @@ class Search:
         self.random = random.Random(challenge.rng_seed)
         self.numpy_random = np.random.default_rng(challenge.rng_seed)
         self.surrogate = LiveSurrogate(challenge.rng_seed)
+        self.arm_members: dict[CompletionArm, list[Candidate]] = {}
         self.last_portfolio: tuple[str, ...] | None = None
 
     def random_candidates(self, count: int) -> list[Candidate]:
         names = self.space.random_names(self.random, max(512, count * 8))
         return self.store.materialize(names, count)
 
+    def _choose_completion_arm(
+        self,
+        arms: Sequence[CompletionArm],
+        posteriors: dict[CompletionArm, tuple[int, int]],
+    ) -> CompletionArm:
+        # Keep an explicit exploration floor. Otherwise Thompson sampling directs
+        # progressively more proposals to arms with current-run top-decile hits.
+        if self.random.random() < 0.20:
+            return self.random.choice(arms)
+        return max(
+            arms,
+            key=lambda arm: self.random.betavariate(*posteriors[arm]),
+        )
+
+    def completion_candidates(
+        self, arms: Sequence[CompletionArm], count: int
+    ) -> list[Candidate]:
+        scored = self.store.scored()
+        elite_threshold = float(
+            np.quantile([candidate.mean_score for candidate in scored], 0.90)
+        )
+        posteriors = {}
+        observed = 0
+        for arm in arms:
+            scores = [
+                candidate.mean_score
+                for candidate in self.arm_members.get(arm, ())
+                if candidate.observations
+            ]
+            hits = sum(score >= elite_threshold for score in scores)
+            posteriors[arm] = (hits + 1, len(scores) - hits + 1)
+            observed += len(scores)
+
+        planned: dict[str, CompletionArm] = {}
+        attempts = 0
+        while len(planned) < count * 4 and attempts < count * 12:
+            attempts += 1
+            arm = self._choose_completion_arm(arms, posteriors)
+            name = self.space.name_from_arm(self.random, arm)
+            if name not in self.store.attempted:
+                planned.setdefault(name, arm)
+
+        candidates = self.store.materialize(planned, count)
+        for candidate in candidates:
+            self.arm_members.setdefault(planned[candidate.name], []).append(candidate)
+        log.info(
+            "completion bandit arms=%d observed=%d elite_threshold=%.6f",
+            len(arms),
+            observed,
+            elite_threshold,
+        )
+        return candidates
+
     def discovery_proposals(self) -> list[Candidate]:
         count = self.scorer.molecules_per_request
         proposal_count = count * self.settings.proposal_multiplier
         seeds = self.store.elite_seeds(18)
         neighbour_count = int(proposal_count * 0.82) if seeds else 0
-        names = list(
-            self.space.neighbour_names(self.random, seeds, neighbour_count)
-        ) + list(self.space.random_names(self.random, proposal_count - neighbour_count))
-        proposals = self.store.materialize(names, proposal_count)
+        arms = self.space.completion_arms(seeds)
+        proposals = self.completion_candidates(arms, neighbour_count) if arms else []
+        proposals.extend(self.random_candidates(proposal_count - len(proposals)))
         if len(proposals) < count:
             proposals.extend(self.random_candidates(count - len(proposals)))
         return proposals

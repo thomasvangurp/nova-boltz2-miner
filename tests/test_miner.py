@@ -12,6 +12,7 @@ from portfolio import maccs_entropy, select_portfolio, write_result
 from search import (
     CandidateStore,
     Challenge,
+    CompletionArm,
     OracleScorer,
     ReactionSpace,
     Search,
@@ -148,6 +149,26 @@ def test_production_defaults_favour_adaptive_discovery(monkeypatch):
     assert settings.prediction_batch == 96
     assert settings.proposal_multiplier == 8
     assert settings.min_surrogate_samples == 96
+
+
+def test_completion_bandit_prefers_an_arm_with_elite_hits(tmp_path):
+    cfg = challenge(num_molecules=20)
+    search = Search(
+        cfg,
+        Settings(prediction_batch=24),
+        str(tmp_path / "result.json"),
+        "/unused",
+        oracle=FakeOracle(),
+        db_path=str(BLUEPRINT_DB),
+    )
+    good = CompletionArm(1, 0, (None, 1))
+    poor = CompletionArm(1, 0, (None, 2))
+    posteriors = {good: (6, 1), poor: (1, 6)}
+    choices = [
+        search._choose_completion_arm((good, poor), posteriors)
+        for _ in range(500)
+    ]
+    assert choices.count(good) > 3 * choices.count(poor)
 
 
 def test_portfolio_is_exact_diverse_and_entropy_safe(tmp_path):
